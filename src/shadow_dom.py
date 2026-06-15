@@ -1,7 +1,11 @@
 import logging
 import re
+import time
+
+from src.human_click import human_like_click_at_viewport, human_pause
 
 logger = logging.getLogger(__name__)
+CHALLENGE_PRE_CLICK_WAIT_SEC = 5
 # Turnstile в closed Shadow DOM: <template shadowrootmode="closed">
 # CSS >>> не поддерживается в Chrome 149 — используем только CDP.
 _TURNSTILE_CDP_QUERIES = (
@@ -39,20 +43,22 @@ def shadow_checkbox_present(driver) -> bool:
         return False
 
 
-_LOGIN_IFRAME_CDP_QUERIES = (
+_TURNSTILE_IFRAME_CDP_QUERIES = (
+    "iframe[id^='cf-chl-widget']",
     "div[appcloudflarerecaptcha] iframe",
     "[appcloudflarerecaptcha] iframe",
-    "iframe[id^='cf-chl-widget']",
     "iframe[src*='challenges.cloudflare.com']",
     "iframe[src*='turnstile']",
     "iframe[src*='0x4AAAAAA']",
     "app-cloudflare-captcha-container iframe",
 )
+# обратная совместимость
+_LOGIN_IFRAME_CDP_QUERIES = _TURNSTILE_IFRAME_CDP_QUERIES
 
 
 def get_login_turnstile_iframe_src(driver) -> str | None:
     """src iframe Turnstile внутри closed Shadow DOM (через CDP)."""
-    node_id = _find_node_via_cdp(driver, _LOGIN_IFRAME_CDP_QUERIES)
+    node_id = _find_node_via_cdp(driver, _TURNSTILE_IFRAME_CDP_QUERIES)
     if node_id is None:
         return None
     try:
@@ -82,16 +88,26 @@ def login_captcha_widget_present(driver) -> bool:
     return get_login_turnstile_iframe_src(driver) is not None
 
 
-def login_captcha_block_present(driver) -> bool:
-    """Блок div[appcloudflarerecaptcha] на форме входа."""
+def turnstile_captcha_block_present(driver) -> bool:
+    """Блок Turnstile: div[appcloudflarerecaptcha] или div+shadow iframe (Challenge / вход)."""
     try:
         return bool(
             driver.execute_script(
-                "return !!document.querySelector('div[appcloudflarerecaptcha]');"
+                """
+                return !!(
+                    document.querySelector('div[appcloudflarerecaptcha]')
+                    || document.querySelector('input[id^="cf-chl-widget"][id$="_response"]')
+                    || document.querySelector('input[name="cf-turnstile-response"]')
+                );
+                """
             )
         )
     except Exception:
         return False
+
+
+def login_captcha_block_present(driver) -> bool:
+    return turnstile_captcha_block_present(driver)
 
 
 def login_captcha_checkbox_present(driver) -> bool:
@@ -125,6 +141,7 @@ def login_captcha_success_visible(driver) -> bool:
 
 
 def click_turnstile_shadow(driver, context: str = "") -> bool:
+    human_pause(0.3, 0.9)
     return click_turnstile_via_cdp(driver, context)
 
 
@@ -215,67 +232,215 @@ def click_login_captcha_checkbox(driver) -> bool:
     return click_turnstile_via_cdp(driver, "login-captcha")
 
 
-def click_login_captcha_widget(driver) -> bool:
-    """ЛКМ по блоку Turnstile на форме входа (div[appcloudflarerecaptcha] / iframe)."""
-    _scroll_login_captcha_block(driver)
+def _get_node_viewport_box(driver, node_id: int) -> dict[str, float] | None:
+    try:
+        driver.execute_cdp_cmd("DOM.scrollIntoViewIfNeeded", {"nodeId": node_id})
+        box = driver.execute_cdp_cmd("DOM.getBoxModel", {"nodeId": node_id})
+        content = box["model"]["content"]
+        left, top, right, bottom = content[0], content[1], content[2], content[5]
+        width = right - left
+        height = bottom - top
+        if width < 10 or height < 10:
+            return None
+        return {
+            "left": left,
+            "top": top,
+            "width": width,
+            "height": height,
+            "right": right,
+            "bottom": bottom,
+        }
+    except Exception:
+        return None
 
-    node_id = _find_node_via_cdp(driver, _LOGIN_IFRAME_CDP_QUERIES)
-    if node_id is not None:
+
+def _find_all_nodes_via_cdp(
+    driver, queries: tuple[str, ...], *, limit: int = 20
+) -> list[int]:
+    found: list[int] = []
+    seen: set[int] = set()
+    for query in queries:
+        search_id = None
         try:
-            box = driver.execute_cdp_cmd("DOM.getBoxModel", {"nodeId": node_id})
-            content = box["model"]["content"]
-            height = content[5] - content[1]
-            if _click_node_via_cdp(
-                driver,
-                node_id,
-                "login-widget:iframe-checkbox",
-                offset_x=35,
-                offset_y=height / 2,
-            ):
-                logger.info("ЛКМ по iframe Turnstile (область чекбокса)")
-                return True
+            result = driver.execute_cdp_cmd(
+                "DOM.performSearch",
+                {"query": query, "includeUserAgentShadowDOM": True},
+            )
+            search_id = result.get("searchId")
+            if not search_id:
+                continue
+            node_ids = driver.execute_cdp_cmd(
+                "DOM.getSearchResults",
+                {"searchId": search_id, "fromIndex": 0, "toIndex": limit},
+            ).get("nodeIds", [])
+            for node_id in node_ids:
+                if node_id not in seen:
+                    seen.add(node_id)
+                    found.append(node_id)
         except Exception as exc:
-            logger.debug("Клик по iframe не удался: %s", exc)
+            logger.debug("DOM.performSearch(%s) не удался: %s", query, exc)
+        finally:
+            if search_id is not None:
+                try:
+                    driver.execute_cdp_cmd(
+                        "DOM.discardSearchResults", {"searchId": search_id}
+                    )
+                except Exception:
+                    pass
+    return found
+
+
+def _pick_visible_turnstile_iframe(driver) -> int | None:
+    """Видимый iframe Turnstile (~300×65) в shadow DOM."""
+    for node_id in _find_all_nodes_via_cdp(driver, _TURNSTILE_IFRAME_CDP_QUERIES):
+        box = _get_node_viewport_box(driver, node_id)
+        if not box:
+            continue
+        if box["width"] >= 180 and 40 <= box["height"] <= 120:
+            logger.debug(
+                "Turnstile iframe: %.0fx%.0f at (%.0f, %.0f)",
+                box["width"],
+                box["height"],
+                box["left"],
+                box["top"],
+            )
+            return node_id
+    return None
+
+
+def _click_turnstile_iframe_checkbox(
+    driver, node_id: int, context: str
+) -> bool:
+    box = _get_node_viewport_box(driver, node_id)
+    if not box:
+        return False
+    x = box["left"] + min(35.0, box["width"] * 0.12)
+    y = box["top"] + box["height"] / 2
+    logger.debug(
+        "Клик по iframe: checkbox at (%.0f, %.0f), iframe (%.0f, %.0f, %.0fx%.0f)",
+        x,
+        y,
+        box["left"],
+        box["top"],
+        box["width"],
+        box["height"],
+    )
+    return _dispatch_mouse_click_at_viewport(driver, x, y, context)
+
+
+def _get_turnstile_block_click_point(driver, context: str) -> dict[str, float] | None:
+    """Fallback-координаты: Challenge — левый верх (300×65), вход — по центру блока."""
+    try:
+        return driver.execute_script(
+            """
+            const context = arguments[0];
+            const login = document.querySelector('div[appcloudflarerecaptcha]');
+            const inp = document.querySelector(
+                'input[id^="cf-chl-widget"][id$="_response"]'
+            );
+            const wrap = login || (inp ? inp.parentElement : null);
+            if (!wrap) return null;
+            wrap.scrollIntoView({block: 'center', inline: 'nearest'});
+            const r = wrap.getBoundingClientRect();
+            if (context === 'login') {
+                return {
+                    x: r.x + Math.min(40, r.width * 0.15),
+                    y: r.y + r.height / 2,
+                };
+            }
+            // Challenge: виджет 300×65, слева-сверху в блоке (не по центру страницы)
+            return { x: r.x + 35, y: r.y + 32 };
+            """,
+            context,
+        )
+    except Exception as exc:
+        logger.debug("Не удалось вычислить точку клика (%s): %s", context, exc)
+        return None
+
+
+def click_turnstile_widget_block(driver, context: str = "turnstile") -> bool:
+    """
+    ЛКМ по блоку Turnstile (форма входа и первый экран Challenge).
+    Структура: div > closed shadow > iframe#cf-chl-widget-* + input[name=cf-turnstile-response].
+    """
+    if context == "challenge":
+        logger.info(
+            "Ожидание %s с перед кликом по капче (Challenge)...",
+            CHALLENGE_PRE_CLICK_WAIT_SEC,
+        )
+        time.sleep(CHALLENGE_PRE_CLICK_WAIT_SEC)
+    else:
+        human_pause(0.6, 1.8)
+    _scroll_turnstile_captcha_block(driver)
+    human_pause(0.2, 0.5)
+
+    iframe_id = _pick_visible_turnstile_iframe(driver)
+    if iframe_id is not None and _click_turnstile_iframe_checkbox(
+        driver, iframe_id, f"{context}:iframe-checkbox"
+    ):
+        logger.info("ЛКМ по iframe Turnstile (%.0f×%.0f, %s)", 300, 65, context)
+        return True
+
+    for node_id in _find_all_nodes_via_cdp(driver, _TURNSTILE_IFRAME_CDP_QUERIES):
+        if _click_turnstile_iframe_checkbox(
+            driver, node_id, f"{context}:iframe-any"
+        ):
+            logger.info("ЛКМ по iframe Turnstile (fallback, %s)", context)
+            return True
 
     for query in _LOGIN_CAPTCHA_CLICK_QUERIES:
         node_id = _find_node_via_cdp(driver, (query,))
         if node_id is not None and _click_node_via_cdp(
-            driver, node_id, f"login-widget:{query}"
+            driver, node_id, f"{context}:{query}"
         ):
-            logger.info("ЛКМ по блоку Turnstile (%s)", query)
+            logger.info("ЛКМ по блоку Turnstile (%s, %s)", query, context)
             return True
 
-    try:
-        rect = driver.execute_script(
-            """
-            const el = document.querySelector('div[appcloudflarerecaptcha]');
-            if (!el) return null;
-            el.scrollIntoView({block: 'center', inline: 'center'});
-            const r = el.getBoundingClientRect();
-            return {x: r.x, y: r.y, width: r.width, height: r.height};
-            """
+    point = _get_turnstile_block_click_point(driver, context)
+    if point and _dispatch_mouse_click_at_viewport(
+        driver, point["x"], point["y"], f"{context}:block"
+    ):
+        logger.info(
+            "ЛКМ по блоку Turnstile (viewport %.0f, %.0f, %s)",
+            point["x"],
+            point["y"],
+            context,
         )
-        if rect and rect.get("width", 0) > 0:
-            x = rect["x"] + min(40, rect["width"] * 0.15)
-            y = rect["y"] + rect["height"] / 2
-            if _dispatch_mouse_click_at_viewport(
-                driver, x, y, "login-block:appcloudflarerecaptcha"
-            ):
-                logger.info("ЛКМ по div[appcloudflarerecaptcha]")
-                return True
-    except Exception as exc:
-        logger.debug("Клик по div[appcloudflarerecaptcha] не удался: %s", exc)
+        return True
 
     return click_login_captcha_checkbox(driver)
 
 
-def _scroll_login_captcha_block(driver) -> None:
+def click_login_captcha_widget(driver) -> bool:
+    """ЛКМ по блоку Turnstile на форме входа."""
+    return click_turnstile_widget_block(driver, context="login")
+
+
+def click_challenge_turnstile_widget(driver) -> bool:
+    """ЛКМ по блоку Turnstile на первом экране Cloudflare Challenge."""
+    return click_turnstile_widget_block(driver, context="challenge")
+
+
+def _scroll_turnstile_captcha_block(driver) -> None:
+    iframe_id = _pick_visible_turnstile_iframe(driver)
+    if iframe_id is not None:
+        try:
+            driver.execute_cdp_cmd(
+                "DOM.scrollIntoViewIfNeeded", {"nodeId": iframe_id}
+            )
+            return
+        except Exception:
+            pass
     try:
         driver.execute_script(
             """
+            const inp = document.querySelector(
+                'input[id^="cf-chl-widget"][id$="_response"]'
+            );
             const el = document.querySelector('div[appcloudflarerecaptcha]')
+                || (inp ? inp.parentElement : null)
                 || document.querySelector('app-cloudflare-captcha-container');
-            if (el) el.scrollIntoView({block: 'center', inline: 'center'});
+            if (el) el.scrollIntoView({block: 'center', inline: 'nearest'});
             """
         )
     except Exception:
@@ -319,23 +484,7 @@ def _click_node_via_cdp(
 def _dispatch_mouse_click_at_viewport(
     driver, x: float, y: float, context: str
 ) -> bool:
-    try:
-        for event_type in ("mouseMoved", "mousePressed", "mouseReleased"):
-            driver.execute_cdp_cmd(
-                "Input.dispatchMouseEvent",
-                {
-                    "type": event_type,
-                    "x": x,
-                    "y": y,
-                    "button": "left",
-                    "clickCount": 1,
-                },
-            )
-        logger.info("ЛКМ через CDP (%s) at (%.0f, %.0f)", context, x, y)
-        return True
-    except Exception as exc:
-        logger.debug("CDP mouse event не удался (%s): %s", context, exc)
-        return False
+    return human_like_click_at_viewport(driver, x, y, context)
 
 
 def _find_turnstile_node_via_cdp(driver) -> int | None:

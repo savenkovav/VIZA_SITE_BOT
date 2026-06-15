@@ -1,6 +1,6 @@
 # Перехват turnstile.render — метод 2captcha/RuCaptcha.
-# Оригинальный render НЕ вызываем. Poll без таймаута — виджет на форме входа
-# может загрузиться позже основной страницы (SPA / iframe).
+# Важно: вызываем оригинальный render, чтобы виджет работал при ручном/человеческом клике.
+# Poll без таймаута — виджет на форме входа может загрузиться позже (SPA / iframe).
 TURNSTILE_HOOK_SCRIPT = """
 (function () {
     console.clear = function () { console.log('Console was cleared'); };
@@ -9,6 +9,7 @@ TURNSTILE_HOOK_SCRIPT = """
         if (!window.turnstile || window.turnstile.__cfWrapped) {
             return !!(window.turnstile && window.turnstile.__cfWrapped);
         }
+        var originalRender = window.turnstile.render.bind(window.turnstile);
         window.turnstile.render = function (container, params) {
             var payload = {
                 sitekey: params.sitekey,
@@ -28,7 +29,7 @@ TURNSTILE_HOOK_SCRIPT = """
                 interceptTs: Date.now()
             };
             window.cfCallback = params.callback;
-            return 'cf-intercepted-' + Date.now();
+            return originalRender(container, params);
         };
         window.turnstile.__cfWrapped = true;
         return true;

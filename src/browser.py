@@ -18,6 +18,7 @@ def _create_undetected_driver(settings: Settings):
     options = uc.ChromeOptions()
     options.add_argument("--window-size=1400,900")
     options.add_argument("--lang=ru-RU,ru")
+    options.add_argument("--disable-blink-features=AutomationControlled")
     options.set_capability(
         "goog:loggingPrefs",
         {"browser": "ALL", "performance": "ALL"},
@@ -89,6 +90,10 @@ def _apply_cdp_hooks(driver, settings: Settings) -> None:
                 Object.defineProperty(navigator, 'webdriver', {
                     get: () => undefined
                 });
+                Object.defineProperty(navigator, 'languages', {
+                    get: () => ['ru-RU', 'ru', 'en-US', 'en']
+                });
+                window.chrome = window.chrome || { runtime: {} };
             """
         },
     )
