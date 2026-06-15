@@ -48,7 +48,7 @@ def load_settings() -> Settings:
             "VFS_LOGIN_URL", "https://visa.vfsglobal.com/blr/ru/pol/login"
         ).strip(),
         rucaptcha_api_key=rucaptcha_key,
-        check_interval_sec=int(os.getenv("CHECK_INTERVAL_SEC", "60")),
+        check_interval_sec=int(os.getenv("CHECK_INTERVAL_SEC", "30")),
         post_403_nav_wait_sec=int(os.getenv("POST_403_NAV_WAIT_SEC", "5")),
         browser_timeout_sec=int(os.getenv("BROWSER_TIMEOUT_SEC", "30")),
         headless=_env_bool("HEADLESS", False),

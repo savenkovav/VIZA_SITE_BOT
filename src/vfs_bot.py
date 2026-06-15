@@ -203,7 +203,9 @@ class VfsLoginBot:
         password_el.send_keys(self.settings.password)
 
         logger.info("Ставлю галочку «Подтвердите, что вы человек»")
-        self._try_solve_standalone_turnstile("login-form")
+        self._dismiss_cookie_banner()
+        self._inject_turnstile_intercept()
+        self._try_solve_turnstile_challenge("форма входа")
 
         time.sleep(2)
 
@@ -212,7 +214,7 @@ class VfsLoginBot:
                 "Кнопка «Войти» недоступна — повторная попытка RuCaptcha для Turnstile"
             )
             time.sleep(3)
-            self._try_solve_standalone_turnstile("login-form")
+            self._try_solve_turnstile_challenge("форма входа")
             time.sleep(2)
             if not self._click_login_button():
                 return False
@@ -323,8 +325,13 @@ class VfsLoginBot:
         click_turnstile_shadow(self.driver, context)
 
     def _try_click_challenge_checkbox(self) -> None:
+        self._try_solve_turnstile_challenge("Cloudflare Challenge")
+
+    def _try_solve_turnstile_challenge(self, label: str) -> None:
+        """Обход Turnstile через intercept turnstile.render + RuCaptcha (Challenge)."""
         self._cached_turnstile_params = {}
-        self._wait_for_turnstile_ready(challenge=True)
+        self._inject_turnstile_intercept()
+        self._wait_for_turnstile_ready(challenge=True, label=label)
 
         if self._rucaptcha and self._solve_turnstile_via_rucaptcha(challenge=True):
             return
@@ -334,10 +341,11 @@ class VfsLoginBot:
             if self._click_turnstile_in_all_frames():
                 return
             time.sleep(1)
-        logger.warning("Чекбокс капчи не найден — возможно, требуется ручное действие")
+        if label == "Cloudflare Challenge":
+            logger.warning("Чекбокс капчи не найден — возможно, требуется ручное действие")
 
     def _wait_for_turnstile_ready(self, *, challenge: bool, label: str = "Turnstile") -> None:
-        kind = "Cloudflare Challenge" if challenge else label
+        kind = "Cloudflare Challenge" if challenge and label == "Turnstile" else label
         wait_sec = CHALLENGE_WIDGET_WAIT_SEC if challenge else LOGIN_TURNSTILE_WAIT_SEC
         logger.info("Ожидаю параметры %s...", kind)
         deadline = time.monotonic() + wait_sec
