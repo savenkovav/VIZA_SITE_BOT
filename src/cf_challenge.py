@@ -1,15 +1,14 @@
 # Перехват turnstile.render — метод 2captcha/RuCaptcha.
-# Без Object.defineProperty (ломает инициализацию Cloudflare).
-# Оригинальный render НЕ вызываем.
+# Оригинальный render НЕ вызываем. Poll без таймаута — виджет на форме входа
+# может загрузиться позже основной страницы (SPA / iframe).
 TURNSTILE_HOOK_SCRIPT = """
 (function () {
-    if (window.__cfTurnstileHookInstalled) return;
-    window.__cfTurnstileHookInstalled = true;
     console.clear = function () { console.log('Console was cleared'); };
 
-    var poll = setInterval(function () {
-        if (!window.turnstile || window.turnstile.__cfWrapped) return;
-        clearInterval(poll);
+    window.__cfTryWrapTurnstile = function () {
+        if (!window.turnstile || window.turnstile.__cfWrapped) {
+            return !!(window.turnstile && window.turnstile.__cfWrapped);
+        }
         window.turnstile.render = function (container, params) {
             var payload = {
                 sitekey: params.sitekey,
@@ -24,13 +23,20 @@ TURNSTILE_HOOK_SCRIPT = """
                 sitekey: params.sitekey,
                 action: params.action || null,
                 cData: params.cData || null,
-                chlPageData: params.chlPageData || null
+                chlPageData: params.chlPageData || null,
+                callback: params.callback || null,
+                interceptTs: Date.now()
             };
             window.cfCallback = params.callback;
             return 'cf-intercepted-' + Date.now();
         };
         window.turnstile.__cfWrapped = true;
-    }, 10);
-    setTimeout(function () { clearInterval(poll); }, 120000);
+        return true;
+    };
+
+    window.__cfTryWrapTurnstile();
+    if (!window.__cfTurnstilePollId) {
+        window.__cfTurnstilePollId = setInterval(window.__cfTryWrapTurnstile, 10);
+    }
 })();
 """

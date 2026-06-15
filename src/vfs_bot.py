@@ -23,9 +23,19 @@ from src.cf_intercept import (
 from src.config import Settings
 from src.rucaptcha import RuCaptchaClient, RuCaptchaError, extract_turnstile_params, merge_turnstile_params
 from src.shadow_dom import (
+    click_login_captcha_widget,
     click_turnstile_shadow,
-    login_captcha_failed,
+    get_login_turnstile_iframe_src,
+    login_captcha_block_present,
     login_captcha_checkbox_present,
+    login_captcha_checkbox_ready,
+    login_captcha_failed,
+    login_captcha_needs_refresh,
+    login_captcha_success_visible,
+    login_captcha_succeeded,
+    login_captcha_verifying,
+    login_captcha_widget_present,
+    parse_sitekey_from_iframe_src,
     refresh_login_captcha_widget,
     shadow_checkbox_present,
 )
@@ -77,7 +87,8 @@ ONETRUST_CLOSE_SELECTORS = [
 LOGIN_EMAIL_CSS = "#email"
 LOGIN_PASSWORD_CSS = "#password"
 LOGIN_BUTTON_CSS = "button.btn-brand-orange"
-LOGIN_CAPTCHA_CONTAINER_CSS = "app-cloudflare-captcha-container"
+LOGIN_CAPTCHA_CONTAINER_CSS = "div[appcloudflarerecaptcha], app-cloudflare-captcha-container"
+LOGIN_TURNSTILE_SITEKEY_FALLBACK = "0x4AAAAAABhlz7Ei4byodYjs"
 
 
 class PageState(Enum):
@@ -96,6 +107,9 @@ class VfsLoginBot:
         self._rucaptcha: RuCaptchaClient | None = None
         self._cached_turnstile_params: dict[str, str | None] = {}
         self._last_turnstile_token: str | None = None
+        self._fresh_intercept_received = False
+        self._callback_frame_path: list[int] | None = None
+        self._login_intercept_at_load = False
         if settings.rucaptcha_api_key:
             self._rucaptcha = RuCaptchaClient(settings.rucaptcha_api_key)
             logger.info("RuCaptcha: сервис обхода капчи включён")
@@ -159,7 +173,8 @@ class VfsLoginBot:
             logger.info("Текущее состояние страницы: %s", state.name)
 
             if state == PageState.LOGIN_FORM:
-                logger.info("Форма «Войти» обнаружена")
+                logger.info("Форма «Войти» обнаружена — жду виджет Turnstile")
+                self._prepare_login_form_on_load()
                 time.sleep(self.settings.post_403_nav_wait_sec)
                 if self._login_form_visible():
                     return self._fill_and_submit_login()
@@ -184,7 +199,8 @@ class VfsLoginBot:
                 )
 
             if self._login_form_visible():
-                logger.info("Форма «Войти» появилась при проверке")
+                logger.info("Форма «Войти» появилась при проверке — жду виджет Turnstile")
+                self._prepare_login_form_on_load()
                 time.sleep(self.settings.post_403_nav_wait_sec)
                 if self._login_form_visible():
                     return self._fill_and_submit_login()
@@ -200,8 +216,114 @@ class VfsLoginBot:
             By.CSS_SELECTOR, LOGIN_PASSWORD_CSS
         )
 
+    def _prepare_login_form_on_load(self, timeout: float = 30) -> bool:
+        """Ждём iframe Turnstile и извлекаем sitekey из URL (standalone, не Challenge)."""
+        logger.info("Ожидаю виджет Turnstile на форме входа")
+        self._inject_turnstile_intercept()
+        deadline = time.monotonic() + timeout
+        last_log_at = 0.0
+
+        while time.monotonic() < deadline:
+            params = self._extract_login_form_turnstile_params()
+            if params.get("sitekey"):
+                self._cached_turnstile_params = params
+                self._login_intercept_at_load = True
+                logger.info(
+                    "Виджет Turnstile готов: sitekey=%s..., iframe=%s",
+                    params["sitekey"][:12],
+                    bool(params.get("iframe_src")),
+                )
+                return True
+
+            now = time.monotonic()
+            if now - last_log_at >= 8:
+                iframe_src = get_login_turnstile_iframe_src(self.driver)
+                logger.info(
+                    "Ожидание виджета... block=%s, iframe=%s, checkbox=%s",
+                    login_captcha_block_present(self.driver),
+                    bool(iframe_src),
+                    login_captcha_checkbox_ready(self.driver),
+                )
+                last_log_at = now
+
+            time.sleep(0.25)
+
+        logger.warning("Виджет Turnstile не появился за %s с", timeout)
+        return False
+
+    def _extract_login_form_turnstile_params(self) -> dict[str, str | None]:
+        iframe_src = get_login_turnstile_iframe_src(self.driver)
+        sitekey = parse_sitekey_from_iframe_src(iframe_src or "")
+        if not sitekey:
+            sitekey = parse_sitekey_from_iframe_src(
+                self._collect_page_source_for_turnstile()
+            )
+        if not sitekey:
+            sitekey = LOGIN_TURNSTILE_SITEKEY_FALLBACK
+
+        hooked = self._read_hooked_turnstile_params()
+        intercept = parse_intercepted_params_from_logs(self.driver) or {}
+
+        return merge_turnstile_params(
+            {
+                "sitekey": sitekey,
+                "pageurl": self.driver.current_url,
+                "useragent": self.driver.execute_script("return navigator.userAgent;"),
+                "iframe_src": iframe_src,
+            },
+            hooked,
+            intercept,
+        )
+
+    def _is_login_captcha_activated(self) -> bool:
+        if login_captcha_success_visible(self.driver) or login_captcha_succeeded(
+            self.driver
+        ):
+            return True
+        return self._is_login_button_enabled()
+
+    def _wait_for_login_captcha_activated(self, timeout: float = 30) -> bool:
+        logger.info("Ожидаю активацию капчи (#success / токен / кнопка «Войти»)...")
+        deadline = time.monotonic() + timeout
+        last_log_at = 0.0
+
+        while time.monotonic() < deadline:
+            if login_captcha_failed(self.driver):
+                logger.warning("Виджет капчи: «Сбой проверки»")
+                return False
+
+            if self._is_login_captcha_activated():
+                if login_captcha_success_visible(self.driver):
+                    logger.info("Капча активирована: #success «Успешно»")
+                elif self._is_login_button_enabled():
+                    logger.info("Капча активирована: кнопка «Войти» доступна")
+                else:
+                    logger.info("Капча активирована: токен в hidden input")
+                return True
+
+            if login_captcha_verifying(self.driver):
+                logger.debug("Turnstile: идёт проверка...")
+
+            now = time.monotonic()
+            if now - last_log_at >= 8:
+                logger.info(
+                    "Ожидание активации... success=%s, token=%s, button=%s, verifying=%s",
+                    login_captcha_success_visible(self.driver),
+                    self._login_captcha_token_present(),
+                    self._is_login_button_enabled(),
+                    login_captcha_verifying(self.driver),
+                )
+                last_log_at = now
+
+            time.sleep(0.5)
+
+        return self._is_login_captcha_activated()
+
     def _fill_and_submit_login(self) -> bool:
         logger.info("Заполняю форму авторизации")
+        self._dismiss_cookie_banner()
+        self._inject_turnstile_intercept()
+
         email_el = self._wait_for_clickable(By.CSS_SELECTOR, LOGIN_EMAIL_CSS)
         password_el = self._wait_for_clickable(By.CSS_SELECTOR, LOGIN_PASSWORD_CSS)
 
@@ -210,16 +332,14 @@ class VfsLoginBot:
         password_el.clear()
         password_el.send_keys(self.settings.password)
 
-        logger.info("Ставлю галочку «Подтвердите, что вы человек»")
-        self._dismiss_cookie_banner()
-        self._inject_turnstile_intercept()
+        logger.info("Активирую капчу «Подтвердите, что вы человек»")
         self._wait_for_login_captcha_widget()
 
         if not self._solve_login_form_captcha(max_attempts=3):
             logger.warning("Не удалось решить капчу на форме входа")
             return False
 
-        if not self._wait_for_login_button_enabled(timeout=20):
+        if not self._wait_for_login_button_enabled(timeout=30):
             logger.warning("Кнопка «Войти» не активировалась после решения капчи")
             return False
 
@@ -231,48 +351,158 @@ class VfsLoginBot:
         return True
 
     def _solve_login_form_captcha(self, max_attempts: int = 3) -> bool:
-        """RuCaptcha + cfCallback. Без клика по чекбоксу — иначе «Сбой проверки»."""
+        """Активация Turnstile: клик по #content → ожидание → RuCaptcha fallback."""
+        if self._is_login_captcha_activated():
+            logger.info("Капча на форме входа уже активирована")
+            return True
+
         for attempt in range(1, max_attempts + 1):
-            if login_captcha_failed(self.driver):
+            if login_captcha_needs_refresh(self.driver):
                 logger.warning(
-                    "Turnstile: «Сбой проверки» — обновляю виджет (попытка %s)", attempt
+                    "Turnstile на форме входа требует обновления (попытка %s)", attempt
                 )
                 refresh_login_captcha_widget(self.driver)
                 time.sleep(2)
 
-            self._cached_turnstile_params = {}
-            self._inject_turnstile_intercept()
-            self._wait_for_turnstile_ready(
-                challenge=True,
-                label="форма входа",
-                allow_checkbox_click=False,
-            )
+            self._wait_for_login_captcha_widget(timeout=15)
+
+            if (
+                login_captcha_block_present(self.driver)
+                or login_captcha_widget_present(self.driver)
+                or login_captcha_checkbox_ready(self.driver)
+            ):
+                logger.info(
+                    "ЛКМ по div[appcloudflarerecaptcha] (попытка %s/%s)",
+                    attempt,
+                    max_attempts,
+                )
+                if click_login_captcha_widget(self.driver):
+                    time.sleep(1)
+                    if self._wait_for_login_captcha_activated(timeout=30):
+                        logger.info(
+                            "Капча активирована кликом по виджету (попытка %s)", attempt
+                        )
+                        return True
+                    if login_captcha_failed(self.driver):
+                        logger.warning(
+                            "После клика: «Сбой проверки», обновляю виджет (попытка %s)",
+                            attempt,
+                        )
+                        refresh_login_captcha_widget(self.driver)
+                        time.sleep(2)
+                        continue
+                else:
+                    logger.warning(
+                        "Не удалось кликнуть по блоку Turnstile (попытка %s)", attempt
+                    )
 
             if not self._rucaptcha:
-                logger.warning("RuCaptcha не настроен")
-                return False
+                logger.warning(
+                    "RuCaptcha не настроен, клик не активировал капчу (попытка %s)",
+                    attempt,
+                )
+                time.sleep(2)
+                continue
 
-            if not self._solve_turnstile_via_rucaptcha(challenge=True, login_form=True):
+            self._inject_turnstile_intercept()
+            params = self._extract_login_form_turnstile_params()
+            sitekey = params.get("sitekey")
+            if not sitekey:
+                iframe_src = get_login_turnstile_iframe_src(self.driver)
+                if iframe_src:
+                    sitekey = parse_sitekey_from_iframe_src(iframe_src)
+                    if sitekey:
+                        params["sitekey"] = sitekey
+                        params["pageurl"] = self.driver.current_url
+
+            if not sitekey:
+                logger.warning(
+                    "Sitekey Turnstile не найден (попытка %s/%s)", attempt, max_attempts
+                )
+                time.sleep(2)
+                continue
+
+            self._cached_turnstile_params = params
+            self._remember_callback_frame()
+
+            logger.info(
+                "RuCaptcha fallback: форма входа standalone (sitekey=%s..., pageurl=%s)",
+                sitekey[:12],
+                params.get("pageurl", "")[:60],
+            )
+
+            if not self._solve_turnstile_via_rucaptcha(challenge=False, login_form=True):
                 logger.warning(
                     "RuCaptcha не решил капчу на форме входа (попытка %s/%s)",
                     attempt,
                     max_attempts,
                 )
+                refresh_login_captcha_widget(self.driver)
                 time.sleep(2)
                 continue
 
-            time.sleep(1)
-            if self._login_captcha_token_present() and not login_captcha_failed(self.driver):
-                logger.info("Капча на форме входа решена (попытка %s)", attempt)
+            if self._wait_for_login_captcha_activated(timeout=30):
+                logger.info("Капча на форме входа решена через RuCaptcha (попытка %s)", attempt)
                 return True
 
             logger.warning(
-                "Токен не принят формой входа (попытка %s/%s)", attempt, max_attempts
+                "Токен RuCaptcha не активировал форму (попытка %s/%s)", attempt, max_attempts
             )
             refresh_login_captcha_widget(self.driver)
             time.sleep(2)
 
         return False
+
+    def _drain_browser_logs(self) -> None:
+        try:
+            self.driver.get_log("browser")
+        except Exception:
+            pass
+
+    def _drain_performance_logs(self) -> None:
+        try:
+            self.driver.get_log("performance")
+        except Exception:
+            pass
+
+    def _reset_turnstile_hook_state(self) -> None:
+        self._fresh_intercept_received = False
+        self._callback_frame_path = None
+        self._cached_turnstile_params = {}
+        clear_script = """
+        delete window.__cfTurnstileParams;
+        delete window.cfCallback;
+        """
+        try:
+            self.driver.switch_to.default_content()
+            self.driver.execute_script(clear_script)
+        except Exception:
+            pass
+        for path in self._enumerate_frame_paths():
+            if not path:
+                continue
+            try:
+                self._switch_to_frame_path(path)
+                self.driver.execute_script(clear_script)
+            except Exception:
+                pass
+        self.driver.switch_to.default_content()
+
+    def _remember_callback_frame(self) -> None:
+        for path in self._enumerate_frame_paths():
+            try:
+                self._switch_to_frame_path(path)
+                has_cb = self.driver.execute_script(
+                    "return typeof window.cfCallback === 'function';"
+                )
+                if has_cb:
+                    self._callback_frame_path = path
+                    logger.info("cfCallback найден во frame %s", path)
+                    self.driver.switch_to.default_content()
+                    return
+            except Exception:
+                pass
+        self.driver.switch_to.default_content()
 
     def _finalize_login_captcha_token(self) -> None:
         token = self._last_turnstile_token
@@ -281,20 +511,32 @@ class VfsLoginBot:
         self.driver.execute_script(
             """
             const token = arguments[0];
-            document.querySelectorAll(
-                'app-cloudflare-captcha-container input[name="cf-turnstile-response"], '
-                + 'app-cloudflare-captcha-container input[id$="_response"]'
-            ).forEach((el) => {
+            const inputs = document.querySelectorAll(
+                'div[appcloudflarerecaptcha] input[name="cf-turnstile-response"], '
+                + 'div[appcloudflarerecaptcha] input[id$="_response"], '
+                + 'app-cloudflare-captcha-container input[name="cf-turnstile-response"], '
+                + 'app-cloudflare-captcha-container input[id$="_response"], '
+                + 'input[name="cf-turnstile-response"]'
+            );
+            inputs.forEach((el) => {
                 el.value = token;
                 el.dispatchEvent(new Event('input', { bubbles: true }));
                 el.dispatchEvent(new Event('change', { bubbles: true }));
             });
-            const form = document.querySelector(
-                'app-login form, app-cloudflare-captcha-container'
-            )?.closest('form');
+
+            const form = document.querySelector('app-login form');
             if (form) {
                 form.dispatchEvent(new Event('input', { bubbles: true }));
                 form.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+
+            const container = document.querySelector('div[appcloudflarerecaptcha]')
+                || document.querySelector('app-cloudflare-captcha-container');
+            if (container) {
+                container.dispatchEvent(new CustomEvent('turnstile-token', {
+                    detail: { token },
+                    bubbles: true,
+                }));
             }
             """,
             token,
@@ -303,15 +545,22 @@ class VfsLoginBot:
     def _wait_for_login_captcha_widget(self, timeout: float = 20) -> bool:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            if self._element_exists(By.CSS_SELECTOR, LOGIN_CAPTCHA_CONTAINER_CSS):
-                if login_captcha_checkbox_present(self.driver) or shadow_checkbox_present(
-                    self.driver
+            if login_captcha_block_present(self.driver):
+                if (
+                    login_captcha_widget_present(self.driver)
+                    or login_captcha_checkbox_ready(self.driver)
+                    or login_captcha_checkbox_present(self.driver)
+                    or shadow_checkbox_present(self.driver)
+                    or self._login_captcha_token_present()
                 ):
-                    logger.info("Виджет капчи на форме входа обнаружен")
+                    logger.info("Блок div[appcloudflarerecaptcha] с Turnstile обнаружен")
                     return True
+                logger.info("Блок div[appcloudflarerecaptcha] найден, жду iframe...")
             time.sleep(0.5)
-        logger.warning("Виджет app-cloudflare-captcha-container не появился за %s с", timeout)
-        return False
+        logger.warning(
+            "Блок div[appcloudflarerecaptcha] не появился за %s с", timeout
+        )
+        return login_captcha_block_present(self.driver)
 
     def _login_captcha_token_present(self) -> bool:
         try:
@@ -319,8 +568,12 @@ class VfsLoginBot:
                 self.driver.execute_script(
                     """
                     const selectors = [
+                        'div[appcloudflarerecaptcha] input[name="cf-turnstile-response"]',
+                        'div[appcloudflarerecaptcha] input[id$="_response"]',
                         'app-cloudflare-captcha-container input[name="cf-turnstile-response"]',
                         'app-cloudflare-captcha-container input[id$="_response"]',
+                        'input[id^="cf-chl-widget"][id$="_response"]',
+                        'input[name="cf-turnstile-response"]',
                     ];
                     for (const sel of selectors) {
                         for (const el of document.querySelectorAll(sel)) {
@@ -334,11 +587,11 @@ class VfsLoginBot:
         except Exception:
             return False
 
-    def _wait_for_login_button_enabled(self, timeout: float = 20) -> bool:
+    def _wait_for_login_button_enabled(self, timeout: float = 30) -> bool:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if login_captcha_failed(self.driver):
-                logger.debug("Виджет капчи в состоянии «Сбой проверки» — жду повторного решения")
+                logger.debug("Виджет капчи в состоянии «Сбой проверки»")
                 return False
             if self._is_login_button_enabled():
                 logger.info("Кнопка «Войти» активна")
@@ -351,6 +604,9 @@ class VfsLoginBot:
             buttons = self.driver.find_elements(By.CSS_SELECTOR, LOGIN_BUTTON_CSS)
             for btn in buttons:
                 if "Войти" not in btn.text:
+                    continue
+                classes = btn.get_attribute("class") or ""
+                if "mat-mdc-button-disabled" in classes:
                     continue
                 disabled = btn.get_attribute("disabled")
                 aria_disabled = btn.get_attribute("aria-disabled")
@@ -602,7 +858,19 @@ class VfsLoginBot:
                 pass
         self.driver.switch_to.default_content()
 
-    def _collect_turnstile_params(self, *, include_standalone: bool = False) -> dict[str, str | None]:
+    def _collect_turnstile_params(
+        self,
+        *,
+        include_standalone: bool = False,
+        fresh_intercept_only: bool = False,
+    ) -> dict[str, str | None]:
+        if fresh_intercept_only:
+            fresh = parse_intercepted_params_from_logs(self.driver) or {}
+            if fresh.get("sitekey"):
+                self._fresh_intercept_received = True
+                self._cached_turnstile_params = merge_turnstile_params({}, fresh)
+            return dict(self._cached_turnstile_params)
+
         sources = [
             parse_intercepted_params_from_logs(self.driver) or {},
             parse_turnstile_params_from_network(self.driver) or {},
@@ -652,7 +920,14 @@ class VfsLoginBot:
 
     def _inject_turnstile_token(self, token: str) -> None:
         callback_called = False
+        frame_paths: list[list[int]] = []
+        if self._callback_frame_path is not None:
+            frame_paths.append(self._callback_frame_path)
         for path in self._enumerate_frame_paths():
+            if path not in frame_paths:
+                frame_paths.append(path)
+
+        for path in frame_paths:
             try:
                 self._switch_to_frame_path(path)
                 called = self.driver.execute_script(
@@ -722,7 +997,12 @@ class VfsLoginBot:
         self, *, challenge: bool = True, login_form: bool = False
     ) -> bool:
         assert self._rucaptcha is not None
-        if not challenge:
+        if login_form:
+            self._cached_turnstile_params = merge_turnstile_params(
+                self._cached_turnstile_params,
+                self._extract_login_form_turnstile_params(),
+            )
+        elif not challenge:
             self._cached_turnstile_params = merge_turnstile_params(
                 self._cached_turnstile_params,
                 self._collect_turnstile_params(include_standalone=True),
