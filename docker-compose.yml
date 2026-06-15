@@ -1,0 +1,10 @@
+services:
+  vfs-bot:
+    build: .
+    container_name: viza-site-bot
+    env_file:
+      - .env
+    environment:
+      HEADLESS: "true"
+    shm_size: "2gb"
+    restart: "no"
